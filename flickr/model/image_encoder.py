@@ -2,14 +2,12 @@ import torch
 import torch.nn as nn
 from torchtune.modules import RotaryPositionalEmbeddings
 
+# TODO apply dropout
+
 
 class ImageEncoder(nn.Module):
     def __init__(self, *, embed_dim, patch_len, num_heads, transformer_layers):
-        if embed_dim % num_heads != 0:
-            raise ValueError(
-                f"Embedding dimension {embed_dim} should be divisible by number of heads {num_heads}"
-            )
-        self.head_dim = embed_dim // num_heads
+        self.num_heads = num_heads
 
         super().__init__()
 
@@ -17,8 +15,11 @@ class ImageEncoder(nn.Module):
 
         self.pos = RotaryPositionalEmbeddings(embed_dim // num_heads)
 
-        self.transformer = MultiHeadSelfAttention(
-            embed_dim=embed_dim, num_heads=num_heads
+        self.transformer = nn.Sequential(
+            *[
+                ImageEncoderLayer(embed_dim=embed_dim, num_heads=num_heads)
+                for _ in range(transformer_layers)
+            ]
         )
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
@@ -35,16 +36,22 @@ class ImageEncoder(nn.Module):
 
         # [batch, patch_count, embed_dim]
         x = self.pos(
-            x.view(*x.shape[:-1], x.shape[-1] // self.head_dim, self.head_dim),
+            x.view(*x.shape[:-1], self.num_heads, -1),
             input_pos=positions,
         ).view(*x.shape)
 
-        x = self.transformer(x, lengths)
+        # [batch, 1, 1, seq_len]
+        pad_mask = (
+            torch.arange(x.shape[1], device=x.device)[None, None, None, :]
+            >= lengths[:, None, None, None]
+        )
 
-        return x
+        x, pad_mask = self.transformer((x, pad_mask))
+
+        return x, pad_mask
 
 
-class TransformerEncoder(nn.Module):
+class ImageEncoderLayer(nn.Module):
     def __init__(self, *, embed_dim, num_heads, ff_dim: int | None = None):
         if embed_dim % num_heads != 0:
             raise ValueError(
@@ -56,7 +63,7 @@ class TransformerEncoder(nn.Module):
 
         super().__init__()
 
-        self.attn = MultiHeadSelfAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.attn = SelfAttention(embed_dim=embed_dim, num_heads=num_heads)
 
         self.ff = nn.Sequential(
             nn.Linear(embed_dim, ff_dim),
@@ -64,18 +71,21 @@ class TransformerEncoder(nn.Module):
             nn.Linear(ff_dim, embed_dim),
         )
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         # x shape [batch, seq_len, embed_dim]
-        # lengths shape [batch]
+        # lengths shape [batch, 1, 1, seq_len]
+        x, pad_mask = x
 
-        x = self.attn(x, lengths)
+        x = self.norm(self.attn(x, pad_mask) + x)
 
-        x = self.ff(x)
+        x = self.norm(self.ff(x) + x)
 
-        return x
+        return x, pad_mask
 
 
-class MultiHeadSelfAttention(nn.Module):
+class SelfAttention(nn.Module):
     def __init__(self, *, embed_dim, num_heads):
         if embed_dim % num_heads != 0:
             raise ValueError(
@@ -100,9 +110,9 @@ class MultiHeadSelfAttention(nn.Module):
         # [batch, num_heads, seq_len, head_dim]
         return x.transpose(1, 2)
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
         # x shape [batch, seq_len, embed_dim]
-        # lengths shape [batch]
+        # lengths shape [batch, 1, 1, seq_len]
 
         # [batch, num_heads, seq_len, head_dim]
         q = self.head_on_view(self.q_proj(x))
@@ -112,14 +122,8 @@ class MultiHeadSelfAttention(nn.Module):
         # [batch, num_heads, seq_len, seq_len]
         a_logits: torch.Tensor = q @ k.transpose(-2, -1) / self.head_scaling
 
-        # [batch, 1, 1, seq_len]
-        mask = (
-            torch.arange(x.shape[1], device=x.device)[None, None, None, :]
-            >= lengths[:, None, None, None]
-        )
-
         # [batch, num_heads, seq_len, seq_len]
-        a = torch.softmax(a_logits.masked_fill(mask, float("-inf")), dim=-1)
+        a = torch.softmax(a_logits.masked_fill(pad_mask, float("-inf")), dim=-1)
 
         # [batch, num_heads, seq_len, head_dim]
         x = a @ v
@@ -128,17 +132,28 @@ class MultiHeadSelfAttention(nn.Module):
         x = x.transpose(1, 2).reshape(x.shape[0], x.shape[2], -1)
 
         # [batch, seq_len, embed_dim]
-        return self.out_proj(x)
+        x = self.out_proj(x)
+
+        return x
 
 
 if __name__ == "__main__":
 
-    attb = ImageEncoder(embed_dim=256, patch_len=64, num_heads=4)
+    attb = ImageEncoder(embed_dim=256, patch_len=64, num_heads=4, transformer_layers=3)
 
-    x = torch.randn(4, 64, 64)
+    # [batch, patch_count, patch_len]
+    x = torch.randn(2, 10, 64)
 
-    lengths = torch.tensor([64, 32, 16, 8])
+    x1 = x.clone()
+    x2 = x.clone()
 
-    out = attb(x, lengths)
+    x1[0] = torch.cat([x1[0][:5], torch.rand(5, 64)], dim=0)
+    lengths = torch.tensor([5, 10])
+
+    out1, _ = attb(x1, lengths)
+    out2, _ = attb(x2, lengths)
+
+    out1[0] = torch.cat([out1[0][:5], torch.ones(5, 256)], dim=0)
+    out2[0] = torch.cat([out2[0][:5], torch.ones(5, 256)], dim=0)
 
     pass
