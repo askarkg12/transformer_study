@@ -18,6 +18,8 @@ val_ds = ds.filter(lambda x: x["split"] == "val")
 class FlickrDataset(Dataset):
     def __init__(self, spm_model_path, split: str = "train", width: int = 480):
         self.tokenizer = spm.SentencePieceProcessor(model_file=spm_model_path)
+        # Padding token is outside of vocab
+        self.pad_id = self.tokenizer.vocab_size()
         self.img_to_tensor = T.ToTensor()
         hg_ds = load_dataset("nlphuji/flickr30k", split="test").filter(
             lambda x: x["split"] == split
@@ -61,25 +63,24 @@ class FlickrDataset(Dataset):
         )
         return patches.squeeze(0).T
 
+    def collate_fn(self, batch):
+        imgs, in_caption, out_caption = zip(*batch)
 
-def collate_fn(batch):
-    imgs, in_caption, out_caption = zip(*batch)
+        img_lens = [img.size(0) for img in imgs]
+        img_tnsr = pad_sequence(imgs, batch_first=True)
 
-    img_lens = [img.size(0) for img in imgs]
-    img_tnsr = pad_sequence(imgs, batch_first=True)
+        # No need to calculate twice
+        caption_lens = [len(caption) for caption in in_caption]
+        in_tnsr = pad_sequence(in_caption, batch_first=True, padding_value=self.pad_id)
+        out_tnsr = torch.cat(out_caption, dim=0)
 
-    # No need to calculate twice
-    caption_lens = [len(caption) for caption in in_caption]
-    in_tnsr = pad_sequence(in_caption, batch_first=True)
-    out_tnsr = torch.cat(out_caption, dim=0)
-
-    return (img_tnsr, img_lens), (in_tnsr, caption_lens), out_tnsr
+        return (img_tnsr, img_lens), (in_tnsr, caption_lens), out_tnsr
 
 
 if __name__ == "__main__":
     dataset = FlickrDataset(spm_model_path="./tokeniser/tknz_20000.model", split="val")
     from torch.utils.data import DataLoader
 
-    dl = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
+    dl = DataLoader(dataset, batch_size=2, collate_fn=dataset.collate_fn)
     for batch in dl:
         pass
